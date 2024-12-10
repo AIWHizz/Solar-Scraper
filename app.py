@@ -5,22 +5,21 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 import json
-import time
+import base64
 
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
-    'Accept-Version': '2',
+    'Accept': 'application/json',
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://v2.aurorasolar.com',
     'Referer': 'https://v2.aurorasolar.com/',
-    'X-Requested-With': 'XMLHttpRequest',
-    'sec-ch-ua': '"Not_A Brand";v="99", "Google Chrome";v="120", "Chromium";v="120"',
-    'sec-ch-ua-mobile': '?0',
-    'sec-ch-ua-platform': '"Windows"',
-    'Content-Type': 'application/json'
+    'Host': 'v2.aurorasolar.com',
+    'Connection': 'keep-alive',
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty'
 }
 
 def debug_print(msg, obj=None):
@@ -29,65 +28,62 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def get_auth_token(proposal_id):
-    """Get authentication token"""
-    auth_url = "https://v2.aurorasolar.com/api/v2/auth/token"
+def get_token(proposal_id):
+    """Get proposal token using their token endpoint"""
+    token_url = "https://v2.aurorasolar.com/api/v2/token"
     payload = {
-        "proposal_id": proposal_id,
-        "grant_type": "proposal_token"
+        "token": proposal_id,
+        "type": "proposal"
     }
     
-    debug_print("Attempting to get auth token...")
-    response = requests.post(auth_url, json=payload, headers=HEADERS)
-    debug_print(f"Auth Response Status: {response.status_code}")
+    debug_print("Requesting token...")
+    response = requests.post(token_url, json=payload, headers=HEADERS)
+    debug_print(f"Token Response Status: {response.status_code}")
     
     if response.status_code == 200:
         try:
-            data = response.json()
-            debug_print("Auth Response:", data)
-            return data.get('access_token')
+            return response.json().get('token')
         except:
-            debug_print("Failed to parse auth response")
+            pass
     return None
 
 def get_proposal_data(link):
-    """Get proposal data with proper authentication"""
+    """Get proposal data using proper token authentication"""
     try:
-        # Step 1: Get version
-        version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
-        version_data = version_response.json()
-        version = version_data.get('version')
-        debug_print(f"Aurora Version: {version}")
-        
-        # Step 2: Extract proposal ID
+        # Extract proposal ID
         proposal_id = link.split('/')[-1]
         debug_print(f"Proposal ID: {proposal_id}")
         
-        # Step 3: Get auth token
-        auth_token = get_auth_token(proposal_id)
-        if auth_token:
-            debug_print("Got auth token")
-        
-        # Step 4: Set up session with proper headers
+        # Create session for consistent cookies
         session = requests.Session()
+        
+        # First, try to get the proposal page to get any necessary cookies
+        debug_print("Getting initial page...")
+        initial_response = session.get(link, headers=HEADERS)
+        debug_print(f"Initial Response Status: {initial_response.status_code}")
+        
+        # Get token
+        token = get_token(proposal_id)
+        if token:
+            debug_print("Got token:", token)
+        
+        # Update headers with token
         headers = HEADERS.copy()
         headers.update({
-            'X-Aurora-Version': version,
-            'X-Auth-Token': auth_token if auth_token else proposal_id,
-            'Authorization': f'Bearer {auth_token}' if auth_token else None
+            'Authorization': f'Bearer {token}' if token else None,
+            'X-Proposal-Token': proposal_id
         })
         
-        # Step 5: Try different endpoints with proper authentication
-        endpoints = [
-            ("https://v2.aurorasolar.com/api/v2/e-proposals/view", "view"),
-            (f"https://v2.aurorasolar.com/api/v2/e-proposals/{proposal_id}", "proposal"),
-            (f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/public", "public"),
-            (f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/summary", "summary")
+        # Try different API patterns
+        api_patterns = [
+            f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/shared",
+            f"https://v2.aurorasolar.com/api/v2/e-proposals/{proposal_id}/shared",
+            f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/public-view",
+            f"https://v2.aurorasolar.com/api/v2/e-proposals/{proposal_id}/public"
         ]
         
-        for url, endpoint_type in endpoints:
-            debug_print(f"\nTrying {endpoint_type} endpoint: {url}")
-            debug_print("Using headers:", headers)
+        for url in api_patterns:
+            debug_print(f"\nTrying endpoint: {url}")
             
             response = session.get(url, headers=headers)
             debug_print(f"Response Status: {response.status_code}")
@@ -95,42 +91,47 @@ def get_proposal_data(link):
             
             if response.status_code == 200:
                 try:
+                    data = response.json()
+                    debug_print("Found JSON response:", data)
+                    return data
+                except json.JSONDecodeError:
                     content_type = response.headers.get('Content-Type', '')
-                    debug_print(f"Content Type: {content_type}")
+                    debug_print(f"Not JSON response (Content-Type: {content_type})")
                     
-                    if 'application/json' in content_type:
-                        data = response.json()
-                        debug_print(f"Found JSON data in {endpoint_type}")
-                        return data
-                    else:
-                        debug_print("Response Content Preview:", response.text[:500])
+                    if 'text/html' in content_type:
+                        soup = BeautifulSoup(response.text, 'html.parser')
                         
-                        # Try to find JSON in HTML
-                        if 'text/html' in content_type:
-                            soup = BeautifulSoup(response.text, 'html.parser')
-                            scripts = soup.find_all('script')
-                            
-                            for script in scripts:
-                                if script.string:
-                                    # Look for various data patterns
-                                    patterns = [
-                                        r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-                                        r'window\.PROPOSAL_DATA\s*=\s*({.*?});',
-                                        r'{"customer":.*"system":.*}'
-                                    ]
-                                    
-                                    for pattern in patterns:
-                                        match = re.search(pattern, str(script.string), re.DOTALL)
-                                        if match:
-                                            try:
-                                                data = json.loads(match.group(1))
-                                                debug_print(f"Found embedded data in {endpoint_type}")
-                                                return data
-                                            except:
-                                                continue
-                
-                except Exception as e:
-                    debug_print(f"Error processing {endpoint_type} response: {str(e)}")
+                        # Look for data in meta tags
+                        meta_tags = soup.find_all('meta', {'name': re.compile(r'proposal-.*')})
+                        if meta_tags:
+                            data = {}
+                            for tag in meta_tags:
+                                key = tag.get('name', '').replace('proposal-', '')
+                                value = tag.get('content', '')
+                                data[key] = value
+                            if data:
+                                debug_print("Found data in meta tags:", data)
+                                return data
+        
+        # If no data found through API, try parsing the HTML
+        debug_print("Attempting to parse HTML response...")
+        soup = BeautifulSoup(initial_response.text, 'html.parser')
+        
+        # Look for customer name
+        customer_patterns = [
+            'proposal-customer-name',
+            'customer-name',
+            'recipient-name'
+        ]
+        
+        for pattern in customer_patterns:
+            element = soup.find(attrs={'data-testid': pattern}) or soup.find(class_=pattern)
+            if element:
+                debug_print(f"Found customer name: {element.text}")
+                return {
+                    'customer_name': element.text.strip(),
+                    'proposal_id': proposal_id
+                }
         
         return None
     
