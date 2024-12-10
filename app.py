@@ -14,106 +14,142 @@ def debug_print(msg, obj=None):
         st.write(obj)
 
 def get_proposal_data(link):
-    """Get proposal data using hybrid approach"""
+    """Get proposal data by simulating the frontend app"""
     try:
         # Extract proposal ID
         proposal_id = link.split('/')[-1]
         debug_print(f"Proposal ID: {proposal_id}")
         
-        # Create session with specific headers
+        # Create session with proper headers
         session = requests.Session()
-        headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-            'Accept': '*/*',
+        
+        # Step 1: Get the app version
+        version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
+        version = version_response.json().get('version')
+        debug_print(f"Aurora Version: {version}")
+        
+        # Step 2: Initialize the app
+        init_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
             'Accept-Language': 'en-US,en;q=0.9',
             'Cache-Control': 'no-cache',
-            'Connection': 'keep-alive',
-            'Origin': 'https://v2.aurorasolar.com',
-            'Referer': f'https://v2.aurorasolar.com/e-proposal/{proposal_id}',
-            'Sec-Fetch-Dest': 'empty',
-            'Sec-Fetch-Mode': 'cors',
-            'Sec-Fetch-Site': 'same-origin',
-            'Pragma': 'no-cache'
+            'Pragma': 'no-cache',
+            'Sec-Fetch-Dest': 'document',
+            'Sec-Fetch-Mode': 'navigate',
+            'Sec-Fetch-Site': 'none',
+            'Sec-Fetch-User': '?1',
+            'Upgrade-Insecure-Requests': '1'
         }
         
-        # Step 1: Initial page load
-        debug_print("Loading initial page...")
-        initial_response = session.get(link, headers=headers)
-        debug_print(f"Initial response status: {initial_response.status_code}")
+        # Get the main page
+        main_url = f"https://v2.aurorasolar.com/e-proposal/{proposal_id}"
+        debug_print(f"Loading main page: {main_url}")
+        response = session.get(main_url, headers=init_headers)
         
-        if initial_response.status_code == 200:
-            # Step 2: Look for data loading endpoints
-            soup = BeautifulSoup(initial_response.text, 'html.parser')
-            scripts = soup.find_all('script')
+        # Step 3: Get the HLB bundle
+        hlb_url = f"https://v2.aurorasolar.com/hlb.{version}.js"
+        debug_print(f"Getting HLB bundle: {hlb_url}")
+        hlb_response = session.get(hlb_url)
+        
+        if hlb_response.status_code == 200:
+            # Extract API endpoints from HLB
+            api_matches = re.findall(r'"/api/v2/([^"]+)"', hlb_response.text)
+            debug_print("Found API endpoints:", api_matches)
+        
+        # Step 4: Get the proposal data
+        api_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+            'Accept': 'application/json',
+            'Accept-Language': 'en-US,en;q=0.9',
+            'Cache-Control': 'no-cache',
+            'Pragma': 'no-cache',
+            'Referer': main_url,
+            'X-Aurora-Version': version,
+            'X-Proposal-Token': proposal_id
+        }
+        
+        # Try multiple API patterns
+        api_patterns = [
+            f"/api/v2/hlb/{proposal_id}",
+            f"/api/v2/hlb/proposals/{proposal_id}",
+            f"/api/v2/e-proposals/{proposal_id}",
+            f"/api/v2/proposals/{proposal_id}/public"
+        ]
+        
+        for endpoint in api_patterns:
+            url = f"https://v2.aurorasolar.com{endpoint}"
+            debug_print(f"\nTrying endpoint: {url}")
             
-            for script in scripts:
-                debug_print("Analyzing script:", script.string[:200] if script.string else "No content")
-                if script.string and 'api' in script.string.lower():
-                    endpoints = re.findall(r'"/api/v2/[^"]+?"', script.string)
-                    debug_print("Found endpoints:", endpoints)
+            response = session.get(url, headers=api_headers)
+            debug_print(f"Response Status: {response.status_code}")
             
-            # Step 3: Try direct data access with different content types
-            content_types = [
-                'application/json',
-                'text/event-stream',
-                'application/x-www-form-urlencoded'
-            ]
-            
-            for content_type in content_types:
-                headers['Accept'] = content_type
-                data_url = f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/data"
-                debug_print(f"Trying {content_type} request to {data_url}")
+            if response.status_code == 200:
+                content_type = response.headers.get('Content-Type', '')
+                debug_print(f"Content Type: {content_type}")
                 
-                try:
-                    response = session.get(data_url, headers=headers, timeout=10)
-                    debug_print(f"Response status: {response.status_code}")
-                    debug_print("Response headers:", dict(response.headers))
+                # If HTML response, parse it
+                if 'text/html' in content_type:
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    debug_print("Parsing HTML response...")
                     
-                    if response.status_code == 200:
-                        try:
-                            return response.json()
-                        except:
-                            debug_print(f"Not JSON response for {content_type}")
-                except:
-                    continue
-            
-            # Step 4: Try WebSocket-style endpoint
-            ws_url = f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/ws"
-            headers['Upgrade'] = 'websocket'
-            headers['Connection'] = 'Upgrade'
-            
-            debug_print("Trying WebSocket-style request...")
-            try:
-                response = session.get(ws_url, headers=headers, timeout=10)
-                debug_print(f"WebSocket response status: {response.status_code}")
-                if response.status_code == 200:
-                    try:
-                        return response.json()
-                    except:
-                        debug_print("Not JSON response from WebSocket endpoint")
-            except:
-                debug_print("WebSocket request failed")
-            
-            # Step 5: Final attempt - look for embedded data
-            debug_print("Looking for embedded data...")
-            patterns = [
-                (r'window\.__INITIAL_STATE__\s*=\s*({.*?});', 'INITIAL_STATE'),
-                (r'window\.PROPOSAL_DATA\s*=\s*({.*?});', 'PROPOSAL_DATA'),
-                (r'data-proposal\s*=\s*\'({.*?})\'', 'data-proposal'),
-                (r'"proposal":\s*({.*?})\s*[,}]', 'proposal object'),
-                (r'{"customer":.*?"system":.*?}', 'full object')
-            ]
-            
-            for pattern, name in patterns:
-                matches = re.finditer(pattern, initial_response.text, re.DOTALL)
-                for match in matches:
-                    try:
-                        data = json.loads(match.group(1))
-                        debug_print(f"Found {name} data!")
+                    # Look for data in multiple ways
+                    data = {}
+                    
+                    # Method 1: Look for specific elements
+                    selectors = {
+                        'customer_name': ['[data-customer-name]', '.customer-name', '#customer-name'],
+                        'system_size': ['[data-system-size]', '.system-size', '#system-size'],
+                        'total_cost': ['[data-total-cost]', '.total-cost', '#total-cost']
+                    }
+                    
+                    for key, selector_list in selectors.items():
+                        for selector in selector_list:
+                            elements = soup.select(selector)
+                            if elements:
+                                data[key] = elements[0].text.strip()
+                                debug_print(f"Found {key}: {data[key]}")
+                    
+                    # Method 2: Look for data attributes
+                    for element in soup.find_all(attrs={"data-": True}):
+                        for attr in element.attrs:
+                            if attr.startswith('data-'):
+                                try:
+                                    data[attr[5:]] = element[attr]
+                                    debug_print(f"Found data attribute: {attr[5:]}")
+                                except:
+                                    continue
+                    
+                    # Method 3: Look for JSON in scripts
+                    for script in soup.find_all('script'):
+                        if script.string:
+                            patterns = [
+                                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
+                                r'window\.PROPOSAL_DATA\s*=\s*({.*?});',
+                                r'data-proposal\s*=\s*\'({.*?})\'',
+                                r'"proposal":\s*({.*?})\s*[,}]'
+                            ]
+                            
+                            for pattern in patterns:
+                                match = re.search(pattern, str(script.string), re.DOTALL)
+                                if match:
+                                    try:
+                                        json_data = json.loads(match.group(1))
+                                        debug_print("Found JSON data in script!")
+                                        return json_data
+                                    except:
+                                        continue
+                    
+                    if data:
                         return data
-                    except:
-                        continue
+                
+                # If JSON response, return it
+                try:
+                    return response.json()
+                except:
+                    debug_print("Not a JSON response")
         
+        debug_print("No data found in any endpoint")
         return None
         
     except Exception as e:
@@ -138,9 +174,9 @@ if st.button("Extract Data", type="primary"):
 
 with st.expander("How it works"):
     st.markdown("""
-    1. Loads initial page
-    2. Analyzes loading patterns
-    3. Tries multiple endpoints
-    4. Attempts different protocols
-    5. Looks for embedded data
+    1. Initializes app environment
+    2. Gets HLB bundle
+    3. Extracts API endpoints
+    4. Tries multiple data sources
+    5. Parses responses for data
     """)
