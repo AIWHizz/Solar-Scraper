@@ -11,15 +11,10 @@ st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Cache-Control': 'no-cache',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-User': '?1',
-    'Sec-Fetch-Dest': 'document'
+    'Origin': 'https://v2.aurorasolar.com',
+    'Referer': 'https://v2.aurorasolar.com/',
 }
 
 def debug_print(msg, obj=None):
@@ -28,120 +23,126 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def extract_data_from_html(html_content):
-    """Extract data from HTML with detailed debugging"""
-    debug_print("Analyzing HTML content...")
+def get_hlb_data(proposal_id, version):
+    """Get data using HLB endpoint"""
+    session = requests.Session()
     
-    soup = BeautifulSoup(html_content, 'html.parser')
+    # First, get the HLB JavaScript
+    hlb_url = f"https://v2.aurorasolar.com/hlb.{version}.js"
+    debug_print(f"Getting HLB JS from: {hlb_url}")
     
-    # Print page title for verification
-    title = soup.find('title')
-    if title:
-        debug_print(f"Page Title: {title.text}")
+    js_response = session.get(hlb_url)
+    debug_print(f"HLB JS Status: {js_response.status_code}")
     
-    # Look for data in scripts
-    scripts = soup.find_all('script')
-    debug_print(f"Found {len(scripts)} script tags")
-    
-    data_patterns = [
-        (r'window\.__INITIAL_STATE__\s*=\s*({.*?});', 'INITIAL_STATE'),
-        (r'window\.PROPOSAL_DATA\s*=\s*({.*?});', 'PROPOSAL_DATA'),
-        (r'data-proposal\s*=\s*\'({.*?})\'', 'data-proposal'),
-        (r'proposal:\s*({.*?})\s*[,}]', 'proposal object')
-    ]
-    
-    for script in scripts:
-        if not script.string:
-            continue
-            
-        script_content = str(script.string)
-        debug_print(f"Analyzing script: {script_content[:200]}...")
+    if js_response.status_code == 200:
+        # Look for API endpoints in the JS
+        api_patterns = [
+            r'"(/api/v2/[^"]+)"',
+            r'"(/hlb/[^"]+)"',
+            r'"(/e-proposals/[^"]+)"'
+        ]
         
-        for pattern, pattern_name in data_patterns:
-            matches = re.finditer(pattern, script_content, re.DOTALL)
-            for match in matches:
+        endpoints = []
+        for pattern in api_patterns:
+            matches = re.findall(pattern, js_response.text)
+            endpoints.extend(matches)
+        
+        debug_print("Found API endpoints:", endpoints)
+        
+        # Try each potential endpoint
+        headers = HEADERS.copy()
+        headers.update({
+            'X-Aurora-Version': version,
+            'X-Proposal-ID': proposal_id,
+            'Accept': 'application/json'
+        })
+        
+        for endpoint in endpoints:
+            url = f"https://v2.aurorasolar.com{endpoint}"
+            if '{id}' in url:
+                url = url.replace('{id}', proposal_id)
+            elif '{proposalId}' in url:
+                url = url.replace('{proposalId}', proposal_id)
+                
+            debug_print(f"Trying endpoint: {url}")
+            response = session.get(url, headers=headers)
+            debug_print(f"Response Status: {response.status_code}")
+            
+            if response.status_code == 200:
                 try:
-                    data = json.loads(match.group(1))
-                    debug_print(f"Found {pattern_name} data:", data)
-                    return data
-                except json.JSONDecodeError:
-                    debug_print(f"Failed to parse {pattern_name} JSON")
-    
-    # Look for data in meta tags
-    meta_tags = soup.find_all('meta')
-    meta_data = {}
-    for tag in meta_tags:
-        name = tag.get('name', '')
-        content = tag.get('content', '')
-        if name and content:
-            meta_data[name] = content
-    
-    if meta_data:
-        debug_print("Found meta data:", meta_data)
-    
-    # Look for specific elements
-    elements_to_check = [
-        ('div', {'class': 'customer-name'}),
-        ('div', {'class': 'proposal-details'}),
-        ('div', {'data-testid': 'customer-name'}),
-        ('div', {'data-testid': 'system-size'}),
-        ('div', {'data-testid': 'total-cost'})
-    ]
-    
-    for tag, attrs in elements_to_check:
-        elem = soup.find(tag, attrs)
-        if elem:
-            debug_print(f"Found element {tag} with {attrs}:", elem.text.strip())
+                    return response.json()
+                except:
+                    debug_print("Not JSON response")
     
     return None
 
 def get_proposal_data(link):
-    """Get proposal data with enhanced error handling and debugging"""
+    """Get proposal data using HLB approach"""
     try:
-        debug_print(f"Processing link: {link}")
+        # Extract proposal ID
+        proposal_id = link.split('/')[-1]
+        debug_print(f"Proposal ID: {proposal_id}")
         
-        # Create session for consistent cookies
+        # Get current version
+        version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
+        version_data = version_response.json()
+        version = version_data.get('version')
+        debug_print(f"Aurora Version: {version}")
+        
+        # Try HLB endpoint first
+        data = get_hlb_data(proposal_id, version)
+        if data:
+            return data
+            
+        # If HLB fails, try direct API
         session = requests.Session()
         
-        # First request: Get the main page
-        debug_print("Making initial request...")
-        response = session.get(link, headers=HEADERS, allow_redirects=True)
+        # Get the initial page to set up session
+        initial_url = f"https://v2.aurorasolar.com/e-proposal/{proposal_id}"
+        debug_print(f"Getting initial page: {initial_url}")
+        
+        headers = HEADERS.copy()
+        headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+            'Cache-Control': 'no-cache'
+        })
+        
+        response = session.get(initial_url, headers=headers)
         debug_print(f"Initial Response Status: {response.status_code}")
-        debug_print("Response Headers:", dict(response.headers))
         
         if response.status_code == 200:
-            # Try to extract data from HTML
-            data = extract_data_from_html(response.text)
-            if data:
-                return data
+            # Try the data endpoint
+            data_url = f"https://v2.aurorasolar.com/api/v2/hlb/proposals/{proposal_id}"
+            headers = HEADERS.copy()
+            headers.update({
+                'Accept': 'application/json',
+                'X-Aurora-Version': version,
+                'X-HLB-Token': proposal_id
+            })
             
-            # If no data found, try to get the frontend JS
-            debug_print("Checking for frontend.js...")
-            soup = BeautifulSoup(response.text, 'html.parser')
-            js_files = [script['src'] for script in soup.find_all('script', src=True)]
+            debug_print(f"Trying data endpoint: {data_url}")
+            response = session.get(data_url, headers=headers)
+            debug_print(f"Data Response Status: {response.status_code}")
             
-            for js_file in js_files:
-                if 'frontend' in js_file or 'main' in js_file:
-                    debug_print(f"Found JS file: {js_file}")
-                    js_response = session.get(js_file, headers=HEADERS)
-                    if js_response.status_code == 200:
-                        debug_print("Got JS content, looking for API patterns...")
-                        
-                        # Look for API endpoints in JS
-                        api_patterns = [
-                            r'"/api/v2/([^"]+)"',
-                            r'"/e-proposals/([^"]+)"',
-                            r'"proposals/([^"]+)/data"'
-                        ]
-                        
-                        for pattern in api_patterns:
-                            matches = re.findall(pattern, js_response.text)
-                            if matches:
-                                debug_print(f"Found API patterns: {matches}")
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except:
+                    debug_print("Not JSON response")
+            
+            # Try one more endpoint pattern
+            alt_url = f"https://v2.aurorasolar.com/api/v2/hlb/{proposal_id}/data"
+            debug_print(f"Trying alternative endpoint: {alt_url}")
+            response = session.get(alt_url, headers=headers)
+            
+            if response.status_code == 200:
+                try:
+                    return response.json()
+                except:
+                    debug_print("Not JSON response")
         
-        debug_print("No data found in initial response")
         return None
-    
+        
     except Exception as e:
         debug_print(f"Error during extraction: {str(e)}")
         return None
