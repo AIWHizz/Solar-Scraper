@@ -5,21 +5,21 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 import json
-import base64
+import time
 
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://v2.aurorasolar.com',
-    'Referer': 'https://v2.aurorasolar.com/',
-    'Host': 'v2.aurorasolar.com',
+    'Cache-Control': 'no-cache',
     'Connection': 'keep-alive',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Dest': 'empty'
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-User': '?1',
+    'Sec-Fetch-Dest': 'document'
 }
 
 def debug_print(msg, obj=None):
@@ -28,111 +28,118 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def get_token(proposal_id):
-    """Get proposal token using their token endpoint"""
-    token_url = "https://v2.aurorasolar.com/api/v2/token"
-    payload = {
-        "token": proposal_id,
-        "type": "proposal"
-    }
+def extract_data_from_html(html_content):
+    """Extract data from HTML with detailed debugging"""
+    debug_print("Analyzing HTML content...")
     
-    debug_print("Requesting token...")
-    response = requests.post(token_url, json=payload, headers=HEADERS)
-    debug_print(f"Token Response Status: {response.status_code}")
+    soup = BeautifulSoup(html_content, 'html.parser')
     
-    if response.status_code == 200:
-        try:
-            return response.json().get('token')
-        except:
-            pass
+    # Print page title for verification
+    title = soup.find('title')
+    if title:
+        debug_print(f"Page Title: {title.text}")
+    
+    # Look for data in scripts
+    scripts = soup.find_all('script')
+    debug_print(f"Found {len(scripts)} script tags")
+    
+    data_patterns = [
+        (r'window\.__INITIAL_STATE__\s*=\s*({.*?});', 'INITIAL_STATE'),
+        (r'window\.PROPOSAL_DATA\s*=\s*({.*?});', 'PROPOSAL_DATA'),
+        (r'data-proposal\s*=\s*\'({.*?})\'', 'data-proposal'),
+        (r'proposal:\s*({.*?})\s*[,}]', 'proposal object')
+    ]
+    
+    for script in scripts:
+        if not script.string:
+            continue
+            
+        script_content = str(script.string)
+        debug_print(f"Analyzing script: {script_content[:200]}...")
+        
+        for pattern, pattern_name in data_patterns:
+            matches = re.finditer(pattern, script_content, re.DOTALL)
+            for match in matches:
+                try:
+                    data = json.loads(match.group(1))
+                    debug_print(f"Found {pattern_name} data:", data)
+                    return data
+                except json.JSONDecodeError:
+                    debug_print(f"Failed to parse {pattern_name} JSON")
+    
+    # Look for data in meta tags
+    meta_tags = soup.find_all('meta')
+    meta_data = {}
+    for tag in meta_tags:
+        name = tag.get('name', '')
+        content = tag.get('content', '')
+        if name and content:
+            meta_data[name] = content
+    
+    if meta_data:
+        debug_print("Found meta data:", meta_data)
+    
+    # Look for specific elements
+    elements_to_check = [
+        ('div', {'class': 'customer-name'}),
+        ('div', {'class': 'proposal-details'}),
+        ('div', {'data-testid': 'customer-name'}),
+        ('div', {'data-testid': 'system-size'}),
+        ('div', {'data-testid': 'total-cost'})
+    ]
+    
+    for tag, attrs in elements_to_check:
+        elem = soup.find(tag, attrs)
+        if elem:
+            debug_print(f"Found element {tag} with {attrs}:", elem.text.strip())
+    
     return None
 
 def get_proposal_data(link):
-    """Get proposal data using proper token authentication"""
+    """Get proposal data with enhanced error handling and debugging"""
     try:
-        # Extract proposal ID
-        proposal_id = link.split('/')[-1]
-        debug_print(f"Proposal ID: {proposal_id}")
+        debug_print(f"Processing link: {link}")
         
         # Create session for consistent cookies
         session = requests.Session()
         
-        # First, try to get the proposal page to get any necessary cookies
-        debug_print("Getting initial page...")
-        initial_response = session.get(link, headers=HEADERS)
-        debug_print(f"Initial Response Status: {initial_response.status_code}")
+        # First request: Get the main page
+        debug_print("Making initial request...")
+        response = session.get(link, headers=HEADERS, allow_redirects=True)
+        debug_print(f"Initial Response Status: {response.status_code}")
+        debug_print("Response Headers:", dict(response.headers))
         
-        # Get token
-        token = get_token(proposal_id)
-        if token:
-            debug_print("Got token:", token)
-        
-        # Update headers with token
-        headers = HEADERS.copy()
-        headers.update({
-            'Authorization': f'Bearer {token}' if token else None,
-            'X-Proposal-Token': proposal_id
-        })
-        
-        # Try different API patterns
-        api_patterns = [
-            f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/shared",
-            f"https://v2.aurorasolar.com/api/v2/e-proposals/{proposal_id}/shared",
-            f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/public-view",
-            f"https://v2.aurorasolar.com/api/v2/e-proposals/{proposal_id}/public"
-        ]
-        
-        for url in api_patterns:
-            debug_print(f"\nTrying endpoint: {url}")
+        if response.status_code == 200:
+            # Try to extract data from HTML
+            data = extract_data_from_html(response.text)
+            if data:
+                return data
             
-            response = session.get(url, headers=headers)
-            debug_print(f"Response Status: {response.status_code}")
-            debug_print("Response Headers:", dict(response.headers))
+            # If no data found, try to get the frontend JS
+            debug_print("Checking for frontend.js...")
+            soup = BeautifulSoup(response.text, 'html.parser')
+            js_files = [script['src'] for script in soup.find_all('script', src=True)]
             
-            if response.status_code == 200:
-                try:
-                    data = response.json()
-                    debug_print("Found JSON response:", data)
-                    return data
-                except json.JSONDecodeError:
-                    content_type = response.headers.get('Content-Type', '')
-                    debug_print(f"Not JSON response (Content-Type: {content_type})")
-                    
-                    if 'text/html' in content_type:
-                        soup = BeautifulSoup(response.text, 'html.parser')
+            for js_file in js_files:
+                if 'frontend' in js_file or 'main' in js_file:
+                    debug_print(f"Found JS file: {js_file}")
+                    js_response = session.get(js_file, headers=HEADERS)
+                    if js_response.status_code == 200:
+                        debug_print("Got JS content, looking for API patterns...")
                         
-                        # Look for data in meta tags
-                        meta_tags = soup.find_all('meta', {'name': re.compile(r'proposal-.*')})
-                        if meta_tags:
-                            data = {}
-                            for tag in meta_tags:
-                                key = tag.get('name', '').replace('proposal-', '')
-                                value = tag.get('content', '')
-                                data[key] = value
-                            if data:
-                                debug_print("Found data in meta tags:", data)
-                                return data
+                        # Look for API endpoints in JS
+                        api_patterns = [
+                            r'"/api/v2/([^"]+)"',
+                            r'"/e-proposals/([^"]+)"',
+                            r'"proposals/([^"]+)/data"'
+                        ]
+                        
+                        for pattern in api_patterns:
+                            matches = re.findall(pattern, js_response.text)
+                            if matches:
+                                debug_print(f"Found API patterns: {matches}")
         
-        # If no data found through API, try parsing the HTML
-        debug_print("Attempting to parse HTML response...")
-        soup = BeautifulSoup(initial_response.text, 'html.parser')
-        
-        # Look for customer name
-        customer_patterns = [
-            'proposal-customer-name',
-            'customer-name',
-            'recipient-name'
-        ]
-        
-        for pattern in customer_patterns:
-            element = soup.find(attrs={'data-testid': pattern}) or soup.find(class_=pattern)
-            if element:
-                debug_print(f"Found customer name: {element.text}")
-                return {
-                    'customer_name': element.text.strip(),
-                    'proposal_id': proposal_id
-                }
-        
+        debug_print("No data found in initial response")
         return None
     
     except Exception as e:
