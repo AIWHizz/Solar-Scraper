@@ -13,18 +13,16 @@ st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 if 'data' not in st.session_state:
     st.session_state.data = pd.DataFrame()
 
-# Enhanced headers with authentication
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+    'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
     'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Dest': 'document',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-User': '?1',
-    'Cache-Control': 'max-age=0'
+    'Sec-Fetch-Site': 'same-origin',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Dest': 'empty',
+    'Cache-Control': 'no-cache',
+    'Pragma': 'no-cache',
 }
 
 def debug_print(msg, obj=None):
@@ -33,113 +31,104 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def extract_data_from_html(html_content):
-    """Extract data from HTML content with enhanced patterns"""
-    debug_print("Extracting data from HTML...")
-    soup = BeautifulSoup(html_content, 'html.parser')
+def extract_proposal_data(response_text):
+    """Extract data with specific focus on finding known patterns"""
+    debug_print("Starting detailed extraction...")
     
-    # Print first 500 chars of HTML for debugging
-    debug_print("HTML Preview:", html_content[:500])
+    # Store the full response for debugging
+    with st.expander("Full Response Text"):
+        st.code(response_text)
     
-    data = {
-        'customer_name': None,
-        'system_size': None,
-        'total_cost': None
+    # First, look for any script tags containing our data
+    soup = BeautifulSoup(response_text, 'html.parser')
+    scripts = soup.find_all('script')
+    
+    debug_print(f"Found {len(scripts)} script tags")
+    
+    # Search for specific data patterns
+    data_patterns = {
+        'name': r'(?:customer|client)(?:["\']\s*:\s*["\'](Rob Appleyard|[^"\']+))',
+        'size': r'(\d+(?:\.\d+)?)\s*kW',
+        'cost': r'\$\s*([\d,]+(?:\.\d+)?)',
     }
     
-    # Customer Name patterns
-    name_patterns = [
-        r'Dear\s+([A-Za-z\s]+)',
-        r'Proposal\s+for\s+([A-Za-z\s]+)',
-        r'Customer:\s*([A-Za-z\s]+)',
-        r'client-name["\']>([^<]+)',
-        r'customer-name["\']>([^<]+)'
-    ]
+    extracted_data = {}
     
-    for pattern in name_patterns:
-        match = re.search(pattern, html_content, re.I)
-        if match:
-            data['customer_name'] = match.group(1).strip()
-            debug_print(f"Found customer name: {data['customer_name']}")
-            break
+    # Search through the entire response text first
+    for key, pattern in data_patterns.items():
+        matches = re.findall(pattern, response_text, re.IGNORECASE)
+        if matches:
+            debug_print(f"Found {key} matches:", matches)
+            extracted_data[key] = matches[0]
     
-    # System Size patterns
-    size_patterns = [
-        r'(\d+\.?\d*)\s*kW\s+system',
-        r'system\s+size:\s*(\d+\.?\d*)\s*kW',
-        r'capacity:\s*(\d+\.?\d*)\s*kW',
-        r'(\d+\.?\d*)\s*kW'
-    ]
+    # If we didn't find the data, try parsing each script tag
+    if not extracted_data:
+        for script in scripts:
+            if script.string:
+                script_text = str(script.string)
+                # Look for window.__INITIAL_STATE__ or similar data
+                if '__INITIAL_STATE__' in script_text or 'PROPOSAL_DATA' in script_text:
+                    debug_print("Found potential data script")
+                    try:
+                        # Try to extract JSON data
+                        json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', script_text, re.DOTALL)
+                        if json_match:
+                            json_data = json.loads(json_match.group(1))
+                            debug_print("Extracted JSON data:", json_data)
+                            # Look for customer data in the JSON
+                            if 'customer' in json_data:
+                                extracted_data['name'] = json_data['customer'].get('name')
+                            if 'system' in json_data:
+                                extracted_data['size'] = json_data['system'].get('size_kw')
+                            if 'pricing' in json_data:
+                                extracted_data['cost'] = json_data['pricing'].get('total_cost')
+                    except Exception as e:
+                        debug_print(f"JSON parsing error: {str(e)}")
     
-    for pattern in size_patterns:
-        match = re.search(pattern, html_content, re.I)
-        if match:
-            data['system_size'] = f"{match.group(1)} kW"
-            debug_print(f"Found system size: {data['system_size']}")
-            break
+    # Try direct HTML elements if we still don't have the data
+    if not extracted_data.get('name'):
+        # Look for specific HTML elements that might contain the name
+        name_elements = [
+            soup.find('div', string=re.compile(r'Rob\s+Appleyard')),
+            soup.find(class_=re.compile(r'customer-name')),
+            soup.find('h1', string=re.compile(r'Rob\s+Appleyard')),
+            soup.find(string=re.compile(r'Dear\s+Rob\s+Appleyard'))
+        ]
+        
+        for elem in name_elements:
+            if elem:
+                debug_print("Found name element:", elem)
+                extracted_data['name'] = elem.text.strip()
+                break
     
-    # Cost patterns
-    cost_patterns = [
-        r'\$\s*([\d,]+\.?\d*)',
-        r'total\s+cost:\s*\$\s*([\d,]+\.?\d*)',
-        r'price:\s*\$\s*([\d,]+\.?\d*)',
-        r'total:\s*\$\s*([\d,]+\.?\d*)'
-    ]
-    
-    for pattern in cost_patterns:
-        match = re.search(pattern, html_content, re.I)
-        if match:
-            data['total_cost'] = f"${match.group(1)}"
-            debug_print(f"Found total cost: {data['total_cost']}")
-            break
-    
-    return data
+    return extracted_data
 
 def get_proposal_data(link):
-    """Get proposal data with session handling"""
+    """Get proposal data with enhanced error handling"""
     session = requests.Session()
     
-    # First request to get cookies and tokens
     try:
+        # First request to get the page
         debug_print("Making initial request...")
         response = session.get(link, headers=HEADERS)
-        debug_print(f"Initial response status: {response.status_code}")
+        debug_print(f"Response status: {response.status_code}")
         
         if response.status_code == 200:
-            # Extract CSRF token if present
-            soup = BeautifulSoup(response.text, 'html.parser')
-            csrf_token = soup.find('meta', {'name': 'csrf-token'})
-            if csrf_token:
-                session.headers.update({'X-CSRF-Token': csrf_token['content']})
-                debug_print("Found and added CSRF token")
+            extracted_data = extract_proposal_data(response.text)
+            debug_print("Extracted data:", extracted_data)
             
-            # Extract data from HTML
-            data = extract_data_from_html(response.text)
-            
-            if not any(data.values()):
-                debug_print("No data found in initial HTML, trying alternative methods...")
-                
-                # Try to find data in script tags
-                scripts = soup.find_all('script')
-                for script in scripts:
-                    if script.string and 'window.' in str(script.string):
-                        debug_print("Found potential data script")
-                        # Look for various data patterns in script
-                        try:
-                            script_content = str(script.string)
-                            data_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', script_content, re.DOTALL)
-                            if data_match:
-                                json_data = json.loads(data_match.group(1))
-                                debug_print("Found JSON data:", json_data)
-                                return json_data
-                        except Exception as e:
-                            debug_print(f"Script parsing error: {str(e)}")
-            
-            return data
+            # Format the data
+            return {
+                'customer_name': extracted_data.get('name', 'Not Found'),
+                'system_size': f"{extracted_data.get('size', 'Not Found')} kW" if extracted_data.get('size') else 'Not Found',
+                'total_cost': f"${extracted_data.get('cost', 'Not Found')}" if extracted_data.get('cost') else 'Not Found'
+            }
     except Exception as e:
-        debug_print(f"Error during data extraction: {str(e)}")
-        return None
+        debug_print(f"Error during extraction: {str(e)}")
+    
+    return None
 
+# Main interface
 st.title("☀️ Aurora Proposal Data Extractor")
 link = st.text_input("Paste Aurora Proposal Link:")
 
@@ -149,21 +138,20 @@ if st.button("Process Link", type="primary"):
             extracted_data = get_proposal_data(link)
             
             if extracted_data:
-                debug_print("Processing extracted data:", extracted_data)
+                debug_print("Final extracted data:", extracted_data)
                 
-                # Format data for display
                 data = {
                     'Date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'Client Name': extracted_data.get('customer_name', 'Not Found'),
-                    'System Size': extracted_data.get('system_size', 'Not Found'),
-                    'Total Cost': extracted_data.get('total_cost', 'Not Found'),
+                    'Client Name': extracted_data['customer_name'],
+                    'System Size': extracted_data['system_size'],
+                    'Total Cost': extracted_data['total_cost'],
                     'Price per Watt': 'Calculating...',
                     'Link': link
                 }
                 
                 # Calculate price per watt if possible
                 try:
-                    if data['System Size'] != 'Not Found' and data['Total Cost'] != 'Not Found':
+                    if 'Not Found' not in [data['System Size'], data['Total Cost']]:
                         size_kw = float(re.search(r'(\d+\.?\d*)', data['System Size']).group(1))
                         cost = float(re.sub(r'[^\d.]', '', data['Total Cost']))
                         data['Price per Watt'] = f"${(cost / (size_kw * 1000)):.2f}"
@@ -179,7 +167,6 @@ if st.button("Process Link", type="primary"):
                 st.success("✅ Data extracted successfully!")
             else:
                 st.error("Could not extract data from the proposal")
-    
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
@@ -201,4 +188,3 @@ with st.expander("Debug Information"):
     st.write("Headers Used:", HEADERS)
     if 'response' in locals():
         st.write("Response Headers:", dict(response.headers))
-        st.write("Content Preview:", response.text[:1000] if hasattr(response, 'text') else "No content available")
