@@ -1,25 +1,26 @@
 import streamlit as st
-import pandas as pd
 import requests
 from bs4 import BeautifulSoup
-from datetime import datetime
 import re
 import json
 import time
+import base64
+from urllib.parse import urljoin
 
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
+    'Accept': '*/*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Accept-Encoding': 'gzip, deflate, br',
-    'Connection': 'keep-alive',
-    'Upgrade-Insecure-Requests': '1',
-    'Sec-Fetch-Site': 'none',
-    'Sec-Fetch-Mode': 'navigate',
-    'Sec-Fetch-User': '?1',
-    'Sec-Fetch-Dest': 'document'
+    'Origin': 'https://v2.aurorasolar.com',
+    'Referer': 'https://v2.aurorasolar.com/',
+    'sec-ch-ua': '"Not_A Brand";v="99", "Google Chrome";v="120", "Chromium";v="120"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
+    'Sec-Fetch-Dest': 'empty',
+    'Sec-Fetch-Mode': 'cors',
+    'Sec-Fetch-Site': 'same-origin',
 }
 
 def debug_print(msg, obj=None):
@@ -28,84 +29,36 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def extract_data_from_response(response):
-    """Extract data from response with detailed debugging"""
-    debug_print("Analyzing response content...")
-    
+@st.cache_data(ttl=3600)
+def get_webpack_manifest():
+    """Get webpack manifest to find correct asset paths"""
     try:
-        content_type = response.headers.get('Content-Type', '')
-        debug_print(f"Content-Type: {content_type}")
-        
-        # Try JSON first
-        if 'application/json' in content_type:
-            try:
-                return response.json()
-            except:
-                debug_print("Failed to parse JSON response")
-        
-        # Parse HTML
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Debug the HTML structure
-        debug_print("HTML Title:", soup.title.string if soup.title else "No title found")
-        debug_print("First 500 chars of HTML:", response.text[:500])
-        
-        # Look for data in scripts
-        scripts = soup.find_all('script')
-        debug_print(f"Found {len(scripts)} script tags")
-        
-        for script in scripts:
-            if not script.string:
-                continue
-                
-            script_content = str(script.string)
-            debug_print("Analyzing script:", script_content[:200])
-            
-            # Look for various data patterns
-            patterns = [
-                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-                r'window\.PROPOSAL_DATA\s*=\s*({.*?});',
-                r'data-proposal\s*=\s*\'({.*?})\'',
-                r'"proposal":\s*({.*?})\s*[,}]'
-            ]
-            
-            for pattern in patterns:
-                matches = re.finditer(pattern, script_content, re.DOTALL)
-                for match in matches:
-                    try:
-                        data = json.loads(match.group(1))
-                        debug_print("Found embedded data!")
-                        return data
-                    except:
-                        continue
-        
-        # Look for specific elements
-        elements = {
-            'customer_name': ['customer-name', 'recipient-name', 'proposal-customer'],
-            'system_size': ['system-size', 'proposal-system', 'system-details'],
-            'total_cost': ['total-cost', 'proposal-cost', 'price-details']
-        }
-        
-        data = {}
-        for key, classes in elements.items():
-            for class_name in classes:
-                element = soup.find(class_=class_name)
-                if element:
-                    data[key] = element.text.strip()
-                    debug_print(f"Found {key}: {data[key]}")
-        
-        if data:
-            return data
-            
-        debug_print("No data found in response")
-        return None
-        
-    except Exception as e:
-        debug_print(f"Error extracting data: {str(e)}")
-        return None
+        manifest_url = "https://v2.aurorasolar.com/asset-manifest.json"
+        response = requests.get(manifest_url)
+        if response.status_code == 200:
+            return response.json()
+    except:
+        pass
+    return None
+
+def get_asset_url(manifest, asset_name):
+    """Get correct URL for webpack asset"""
+    if manifest and asset_name in manifest.get('files', {}):
+        return urljoin("https://v2.aurorasolar.com/", manifest['files'][asset_name])
+    return None
+
+def extract_proposal_token(proposal_id):
+    """Extract and decode proposal token"""
+    try:
+        # Base64 decode the proposal ID
+        decoded = base64.urlsafe_b64decode(proposal_id + '=' * (-len(proposal_id) % 4))
+        debug_print(f"Decoded proposal token: {decoded}")
+        return decoded.decode('utf-8')
+    except:
+        return proposal_id
 
 def get_proposal_data(link):
-    """Get proposal data with progressive loading"""
+    """Get proposal data with webpack handling"""
     try:
         # Extract proposal ID
         proposal_id = link.split('/')[-1]
@@ -114,50 +67,103 @@ def get_proposal_data(link):
         # Create session
         session = requests.Session()
         
-        # Get version first
+        # Get webpack manifest
+        manifest = get_webpack_manifest()
+        debug_print("Got webpack manifest:", manifest is not None)
+        
+        # Get current version
         version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
         version_data = version_response.json()
         version = version_data.get('version')
         debug_print(f"Aurora Version: {version}")
         
-        # Initial page load
-        debug_print("Loading initial page...")
-        response = session.get(link, headers=HEADERS)
-        debug_print(f"Initial Response Status: {response.status_code}")
+        # Get HLB bundle
+        hlb_url = f"https://v2.aurorasolar.com/hlb.{version}.js"
+        debug_print(f"Getting HLB bundle from: {hlb_url}")
         
-        # Try to extract data
-        data = extract_data_from_response(response)
-        if data:
-            return data
+        hlb_response = session.get(hlb_url)
+        if hlb_response.status_code == 200:
+            # Extract API endpoints from HLB bundle
+            api_patterns = [
+                r'"/api/v2/([^"]+)"',
+                r'"/hlb/([^"]+)"',
+                r'"/e-proposals/([^"]+)"'
+            ]
+            
+            endpoints = []
+            for pattern in api_patterns:
+                matches = re.findall(pattern, hlb_response.text)
+                endpoints.extend(matches)
+            
+            debug_print("Found API endpoints:", endpoints)
         
-        # Wait and try again
-        debug_print("Waiting for page load...")
-        time.sleep(10)
+        # Extract proposal token
+        token = extract_proposal_token(proposal_id)
+        debug_print("Extracted token:", token)
         
-        # Try different endpoints
-        endpoints = [
-            f"/api/v2/proposals/{proposal_id}/view",
-            f"/api/v2/proposals/{proposal_id}/data",
-            f"/api/v2/e-proposals/{proposal_id}/content",
-            f"/api/v2/hlb/proposals/{proposal_id}"
+        # Try different API patterns
+        api_patterns = [
+            ('hlb', f"/api/v2/hlb/proposals/{proposal_id}/data"),
+            ('view', f"/api/v2/hlb/{proposal_id}/view"),
+            ('content', f"/api/v2/e-proposals/{proposal_id}/content"),
+            ('public', f"/api/v2/proposals/{proposal_id}/public")
         ]
         
-        for endpoint in endpoints:
+        for endpoint_type, endpoint in api_patterns:
             url = f"https://v2.aurorasolar.com{endpoint}"
-            debug_print(f"\nTrying endpoint: {url}")
+            debug_print(f"\nTrying {endpoint_type} endpoint: {url}")
             
-            headers = HEADERS.copy()
-            headers.update({
+            # Prepare headers for this request
+            request_headers = HEADERS.copy()
+            request_headers.update({
                 'X-Aurora-Version': version,
-                'Accept': 'application/json'
+                'X-Proposal-Token': token,
+                'X-Request-ID': proposal_id,
+                'Accept': 'application/json',
+                'Content-Type': 'application/json'
             })
             
-            response = session.get(url, headers=headers)
-            debug_print(f"Response Status: {response.status_code}")
+            # Try OPTIONS first
+            options_response = session.options(url, headers=request_headers)
+            debug_print(f"OPTIONS Status: {options_response.status_code}")
             
-            data = extract_data_from_response(response)
-            if data:
-                return data
+            # Then make the actual request
+            response = session.get(url, headers=request_headers)
+            debug_print(f"GET Status: {response.status_code}")
+            
+            try:
+                content_type = response.headers.get('Content-Type', '')
+                debug_print(f"Content-Type: {content_type}")
+                
+                if 'application/json' in content_type:
+                    data = response.json()
+                    debug_print("Found JSON data!")
+                    return data
+                elif 'text/html' in content_type:
+                    # Parse HTML response
+                    soup = BeautifulSoup(response.text, 'html.parser')
+                    
+                    # Look for data in scripts
+                    for script in soup.find_all('script'):
+                        if script.string:
+                            # Try different data patterns
+                            patterns = [
+                                (r'window\.__INITIAL_STATE__\s*=\s*({.*?});', 'INITIAL_STATE'),
+                                (r'window\.PROPOSAL_DATA\s*=\s*({.*?});', 'PROPOSAL_DATA'),
+                                (r'{"proposal":\s*({.*?})\s*}', 'proposal object')
+                            ]
+                            
+                            for pattern, pattern_name in patterns:
+                                match = re.search(pattern, str(script.string), re.DOTALL)
+                                if match:
+                                    try:
+                                        data = json.loads(match.group(1))
+                                        debug_print(f"Found {pattern_name} data!")
+                                        return data
+                                    except:
+                                        continue
+            except Exception as e:
+                debug_print(f"Error processing response: {str(e)}")
         
         return None
         
@@ -166,20 +172,29 @@ def get_proposal_data(link):
         return None
 
 st.title("☀️ Aurora Proposal Data Extractor")
+st.markdown("""
+This tool extracts data from Aurora Solar proposals. 
+Please paste a complete Aurora proposal link below.
+""")
+
 link = st.text_input("Paste Aurora Proposal Link:")
 
 if st.button("Extract Data", type="primary"):
     try:
-        with st.spinner("Processing proposal (this may take 15-20 seconds)..."):
+        with st.spinner("Processing proposal (this may take a few moments)..."):
             data = get_proposal_data(link)
             
             if data:
                 st.success("Data extracted!")
                 st.json(data)
             else:
-                st.error("Could not extract data")
+                st.error("Could not extract data. Please check the link and try again.")
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
 with st.expander("Debug Information"):
-    st.write("Headers Used:", HEADERS)
+    st.markdown("""
+    ### Headers Used
+    These are the base headers used for requests:
+    """)
+    st.json(HEADERS)
