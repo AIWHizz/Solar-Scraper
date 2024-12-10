@@ -4,6 +4,7 @@ from bs4 import BeautifulSoup
 import re
 import json
 import time
+import base64
 
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 
@@ -13,145 +14,132 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def get_proposal_data(link):
-    """Get proposal data by simulating the frontend app"""
+def decode_proposal_id(proposal_id):
+    """Decode the proposal ID if it's base64 encoded"""
     try:
-        # Extract proposal ID
-        proposal_id = link.split('/')[-1]
-        debug_print(f"Proposal ID: {proposal_id}")
+        # Add padding if needed
+        padding = 4 - (len(proposal_id) % 4)
+        if padding != 4:
+            proposal_id += '=' * padding
         
-        # Create session with proper headers
+        decoded = base64.urlsafe_b64decode(proposal_id)
+        return decoded.hex()
+    except:
+        return proposal_id
+
+def get_proposal_data(link):
+    """Get proposal data with enhanced debugging"""
+    try:
+        # Extract and decode proposal ID
+        proposal_id = link.split('/')[-1]
+        decoded_id = decode_proposal_id(proposal_id)
+        debug_print(f"Proposal ID: {proposal_id}")
+        debug_print(f"Decoded ID: {decoded_id}")
+        
+        # Create session
         session = requests.Session()
         
-        # Step 1: Get the app version
+        # Step 1: Get version and establish session
+        debug_print("Getting Aurora version...")
         version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
         version = version_response.json().get('version')
         debug_print(f"Aurora Version: {version}")
         
-        # Step 2: Initialize the app
-        init_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
+        # Base headers
+        base_headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+            'Accept': 'application/json, text/plain, */*',
             'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Sec-Fetch-Dest': 'document',
+            'Origin': 'https://v2.aurorasolar.com',
+            'Referer': f'https://v2.aurorasolar.com/e-proposal/{proposal_id}',
+            'Connection': 'keep-alive',
+            'Sec-Fetch-Dest': 'empty',
+            'Sec-Fetch-Mode': 'cors',
+            'Sec-Fetch-Site': 'same-origin',
+            'X-Aurora-Version': version,
+            'X-Requested-With': 'XMLHttpRequest'
+        }
+        
+        # Step 2: Initial page load with proper headers
+        debug_print("Loading initial page...")
+        initial_url = f"https://v2.aurorasolar.com/e-proposal/{proposal_id}"
+        initial_headers = base_headers.copy()
+        initial_headers.update({
+            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
             'Sec-Fetch-Mode': 'navigate',
-            'Sec-Fetch-Site': 'none',
             'Sec-Fetch-User': '?1',
             'Upgrade-Insecure-Requests': '1'
-        }
+        })
         
-        # Get the main page
-        main_url = f"https://v2.aurorasolar.com/e-proposal/{proposal_id}"
-        debug_print(f"Loading main page: {main_url}")
-        response = session.get(main_url, headers=init_headers)
+        response = session.get(initial_url, headers=initial_headers)
+        debug_print(f"Initial page status: {response.status_code}")
         
-        # Step 3: Get the HLB bundle
-        hlb_url = f"https://v2.aurorasolar.com/hlb.{version}.js"
-        debug_print(f"Getting HLB bundle: {hlb_url}")
-        hlb_response = session.get(hlb_url)
-        
-        if hlb_response.status_code == 200:
-            # Extract API endpoints from HLB
-            api_matches = re.findall(r'"/api/v2/([^"]+)"', hlb_response.text)
-            debug_print("Found API endpoints:", api_matches)
-        
-        # Step 4: Get the proposal data
-        api_headers = {
-            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-            'Accept': 'application/json',
-            'Accept-Language': 'en-US,en;q=0.9',
-            'Cache-Control': 'no-cache',
-            'Pragma': 'no-cache',
-            'Referer': main_url,
-            'X-Aurora-Version': version,
-            'X-Proposal-Token': proposal_id
-        }
-        
-        # Try multiple API patterns
-        api_patterns = [
-            f"/api/v2/hlb/{proposal_id}",
-            f"/api/v2/hlb/proposals/{proposal_id}",
-            f"/api/v2/e-proposals/{proposal_id}",
-            f"/api/v2/proposals/{proposal_id}/public"
-        ]
-        
-        for endpoint in api_patterns:
-            url = f"https://v2.aurorasolar.com{endpoint}"
-            debug_print(f"\nTrying endpoint: {url}")
+        if response.status_code == 200:
+            # Step 3: Handle CORS preflight
+            debug_print("Sending CORS preflight...")
+            options_headers = {
+                'Access-Control-Request-Method': 'GET',
+                'Access-Control-Request-Headers': 'x-aurora-version,x-requested-with',
+                'Origin': 'https://v2.aurorasolar.com'
+            }
             
-            response = session.get(url, headers=api_headers)
-            debug_print(f"Response Status: {response.status_code}")
+            session.options(initial_url, headers=options_headers)
             
-            if response.status_code == 200:
-                content_type = response.headers.get('Content-Type', '')
-                debug_print(f"Content Type: {content_type}")
+            # Step 4: Try different API endpoints with proper headers
+            endpoints = [
+                ('data', f"/api/v2/proposals/{proposal_id}/data"),
+                ('view', f"/api/v2/proposals/{proposal_id}/view"),
+                ('hlb', f"/api/v2/hlb/proposals/{proposal_id}"),
+                ('public', f"/api/v2/proposals/{proposal_id}/public")
+            ]
+            
+            for name, endpoint in endpoints:
+                url = f"https://v2.aurorasolar.com{endpoint}"
+                debug_print(f"\nTrying {name} endpoint: {url}")
                 
-                # If HTML response, parse it
-                if 'text/html' in content_type:
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    debug_print("Parsing HTML response...")
-                    
-                    # Look for data in multiple ways
-                    data = {}
-                    
-                    # Method 1: Look for specific elements
-                    selectors = {
-                        'customer_name': ['[data-customer-name]', '.customer-name', '#customer-name'],
-                        'system_size': ['[data-system-size]', '.system-size', '#system-size'],
-                        'total_cost': ['[data-total-cost]', '.total-cost', '#total-cost']
-                    }
-                    
-                    for key, selector_list in selectors.items():
-                        for selector in selector_list:
-                            elements = soup.select(selector)
-                            if elements:
-                                data[key] = elements[0].text.strip()
-                                debug_print(f"Found {key}: {data[key]}")
-                    
-                    # Method 2: Look for data attributes
-                    for element in soup.find_all(attrs={"data-": True}):
-                        for attr in element.attrs:
-                            if attr.startswith('data-'):
-                                try:
-                                    data[attr[5:]] = element[attr]
-                                    debug_print(f"Found data attribute: {attr[5:]}")
-                                except:
-                                    continue
-                    
-                    # Method 3: Look for JSON in scripts
-                    for script in soup.find_all('script'):
-                        if script.string:
-                            patterns = [
-                                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-                                r'window\.PROPOSAL_DATA\s*=\s*({.*?});',
-                                r'data-proposal\s*=\s*\'({.*?})\'',
-                                r'"proposal":\s*({.*?})\s*[,}]'
-                            ]
-                            
-                            for pattern in patterns:
-                                match = re.search(pattern, str(script.string), re.DOTALL)
-                                if match:
-                                    try:
-                                        json_data = json.loads(match.group(1))
-                                        debug_print("Found JSON data in script!")
-                                        return json_data
-                                    except:
-                                        continue
-                    
-                    if data:
+                # Add specific headers for this request
+                request_headers = base_headers.copy()
+                request_headers.update({
+                    'X-Proposal-Token': proposal_id,
+                    'Authorization': f'Proposal {proposal_id}'
+                })
+                
+                debug_print("Using headers:", request_headers)
+                
+                response = session.get(url, headers=request_headers)
+                debug_print(f"Response status: {response.status_code}")
+                debug_print("Response headers:", dict(response.headers))
+                
+                if response.status_code == 200:
+                    try:
+                        data = response.json()
+                        debug_print("Found JSON data!")
                         return data
-                
-                # If JSON response, return it
-                try:
-                    return response.json()
-                except:
-                    debug_print("Not a JSON response")
-        
-        debug_print("No data found in any endpoint")
-        return None
-        
+                    except json.JSONDecodeError:
+                        debug_print("Response content preview:", response.text[:500])
+                        
+                        # Try to parse HTML
+                        soup = BeautifulSoup(response.text, 'html.parser')
+                        
+                        # Look for data in specific elements
+                        elements = {
+                            'customer_name': soup.find(class_='customer-name'),
+                            'system_size': soup.find(class_='system-size'),
+                            'total_cost': soup.find(class_='total-cost')
+                        }
+                        
+                        extracted_data = {}
+                        for key, element in elements.items():
+                            if element:
+                                extracted_data[key] = element.text.strip()
+                                debug_print(f"Found {key}: {extracted_data[key]}")
+                        
+                        if extracted_data:
+                            return extracted_data
+            
+            debug_print("No data found in any endpoint")
+            return None
+            
     except Exception as e:
         debug_print(f"Error during extraction: {str(e)}")
         return None
@@ -174,9 +162,9 @@ if st.button("Extract Data", type="primary"):
 
 with st.expander("How it works"):
     st.markdown("""
-    1. Initializes app environment
-    2. Gets HLB bundle
-    3. Extracts API endpoints
-    4. Tries multiple data sources
-    5. Parses responses for data
+    1. Decodes proposal ID
+    2. Establishes proper session
+    3. Handles CORS requirements
+    4. Tries multiple endpoints
+    5. Extracts data from responses
     """)
