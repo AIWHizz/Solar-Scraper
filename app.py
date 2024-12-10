@@ -6,15 +6,23 @@ from datetime import datetime
 import re
 import json
 import time
+import asyncio
+import aiohttp
 
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
-    'Accept': 'application/json, text/plain, */*',
+    'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Origin': 'https://v2.aurorasolar.com',
-    'Referer': 'https://v2.aurorasolar.com/',
+    'Accept-Encoding': 'gzip, deflate, br',
+    'Connection': 'keep-alive',
+    'Upgrade-Insecure-Requests': '1',
+    'Sec-Fetch-Site': 'none',
+    'Sec-Fetch-Mode': 'navigate',
+    'Sec-Fetch-User': '?1',
+    'Sec-Fetch-Dest': 'document',
+    'Cache-Control': 'max-age=0'
 }
 
 def debug_print(msg, obj=None):
@@ -23,127 +31,133 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
+def parse_html_content(html_content):
+    """Parse HTML content for proposal data"""
+    debug_print("Parsing HTML content...")
+    soup = BeautifulSoup(html_content, 'html.parser')
+    
+    # Print the first 1000 characters of HTML for debugging
+    debug_print("HTML Preview:", html_content[:1000])
+    
+    data = {}
+    
+    # Look for scripts containing data
+    scripts = soup.find_all('script')
+    debug_print(f"Found {len(scripts)} script tags")
+    
+    for script in scripts:
+        if not script.string:
+            continue
+            
+        script_content = str(script.string)
+        debug_print("Analyzing script content:", script_content[:200])
+        
+        # Look for various data patterns
+        patterns = [
+            (r'window\.__INITIAL_STATE__\s*=\s*({.*?});', 'INITIAL_STATE'),
+            (r'window\.PROPOSAL_DATA\s*=\s*({.*?});', 'PROPOSAL_DATA'),
+            (r'data-proposal\s*=\s*\'({.*?})\'', 'data-proposal'),
+            (r'"proposal":\s*({.*?})\s*[,}]', 'proposal object')
+        ]
+        
+        for pattern, pattern_name in patterns:
+            matches = re.finditer(pattern, script_content, re.DOTALL)
+            for match in matches:
+                try:
+                    json_data = json.loads(match.group(1))
+                    debug_print(f"Found {pattern_name} data:", json_data)
+                    return json_data
+                except json.JSONDecodeError:
+                    debug_print(f"Failed to parse {pattern_name} JSON")
+    
+    # Look for specific elements
+    elements_to_check = {
+        'customer_name': ['customer-name', 'recipient-name', 'proposal-customer'],
+        'system_size': ['system-size', 'proposal-system', 'system-details'],
+        'total_cost': ['total-cost', 'proposal-cost', 'price-details']
+    }
+    
+    for key, classes in elements_to_check.items():
+        for class_name in classes:
+            element = soup.find(class_=class_name)
+            if element:
+                data[key] = element.text.strip()
+                debug_print(f"Found {key}: {data[key]}")
+    
+    # Look for meta tags
+    meta_tags = soup.find_all('meta')
+    for tag in meta_tags:
+        name = tag.get('name', '')
+        if name and ('proposal' in name.lower() or 'customer' in name.lower()):
+            content = tag.get('content', '')
+            debug_print(f"Found meta tag {name}: {content}")
+            data[name] = content
+    
+    return data if data else None
+
 def get_proposal_data(link):
     """Get proposal data with progressive loading"""
     try:
-        # Extract proposal ID
-        proposal_id = link.split('/')[-1]
-        debug_print(f"Proposal ID: {proposal_id}")
+        debug_print(f"Processing link: {link}")
         
-        # Create session for consistent cookies
+        # Create session
         session = requests.Session()
         
-        # Step 1: Get version
-        version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
-        version_data = version_response.json()
-        version = version_data.get('version')
-        debug_print(f"Aurora Version: {version}")
+        # Step 1: Initial page load
+        debug_print("Making initial request...")
+        response = session.get(link, headers=HEADERS)
+        debug_print(f"Initial response status: {response.status_code}")
         
-        # Step 2: Initial page load
-        initial_headers = HEADERS.copy()
-        initial_headers.update({
-            'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-            'Cache-Control': 'no-cache'
-        })
-        
-        debug_print("Loading initial page...")
-        response = session.get(link, headers=initial_headers)
-        debug_print(f"Initial Response Status: {response.status_code}")
-        
-        # Step 3: Get HLB JavaScript
-        hlb_url = f"https://v2.aurorasolar.com/hlb.{version}.js"
-        debug_print(f"Getting HLB JS from: {hlb_url}")
-        
-        js_response = session.get(hlb_url)
-        debug_print(f"HLB JS Status: {js_response.status_code}")
-        
-        if js_response.status_code == 200:
-            # Look for API endpoints in JS
-            endpoints = re.findall(r'"(/api/v2/[^"]+)"', js_response.text)
-            debug_print("Found API endpoints:", endpoints)
-        
-        # Step 4: Try different data endpoints with delays
-        endpoints = [
-            f"/api/v2/hlb/proposals/{proposal_id}/data",
-            f"/api/v2/hlb/{proposal_id}/view",
-            f"/api/v2/e-proposals/{proposal_id}/content",
-            f"/api/v2/proposals/{proposal_id}/public"
-        ]
-        
-        for endpoint in endpoints:
-            url = f"https://v2.aurorasolar.com{endpoint}"
-            debug_print(f"\nTrying endpoint: {url}")
+        if response.status_code == 200:
+            # Extract data from HTML
+            debug_print("Extracting data from HTML...")
+            data = parse_html_content(response.text)
             
-            # Add delay to simulate page load
-            time.sleep(2)
+            if data:
+                return data
             
-            headers = HEADERS.copy()
-            headers.update({
-                'X-Aurora-Version': version,
-                'X-Proposal-Token': proposal_id,
-                'Accept': 'application/json',
-                'Cache-Control': 'no-cache',
-                'Pragma': 'no-cache'
-            })
+            # If no data found, try alternative methods
+            debug_print("No data found in initial HTML, trying alternative methods...")
             
-            debug_print("Using headers:", headers)
+            # Get version
+            version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
+            version_data = version_response.json()
+            version = version_data.get('version')
             
-            response = session.get(url, headers=headers)
-            debug_print(f"Response Status: {response.status_code}")
+            # Try loading frontend.js
+            js_url = f"https://v2.aurorasolar.com/frontend.{version}.js"
+            js_response = session.get(js_url)
             
-            if response.status_code == 200:
-                try:
-                    # Try to parse as JSON first
-                    data = response.json()
-                    debug_print("Found JSON response!")
-                    return data
-                except json.JSONDecodeError:
-                    # If not JSON, try to find data in HTML
-                    soup = BeautifulSoup(response.text, 'html.parser')
-                    
-                    # Look for data in scripts
-                    for script in soup.find_all('script'):
-                        if script.string:
-                            # Try different data patterns
-                            patterns = [
-                                r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-                                r'window\.PROPOSAL_DATA\s*=\s*({.*?});',
-                                r'{"proposal":\s*({.*?})\s*}',
-                                r'data-proposal=\'({.*?})\''
-                            ]
-                            
-                            for pattern in patterns:
-                                match = re.search(pattern, str(script.string), re.DOTALL)
-                                if match:
-                                    try:
-                                        data = json.loads(match.group(1))
-                                        debug_print("Found embedded data!")
-                                        return data
-                                    except:
-                                        continue
-        
-        # If no data found through API, try parsing the initial HTML
-        debug_print("Trying to parse initial HTML...")
-        soup = BeautifulSoup(response.text, 'html.parser')
-        
-        # Look for specific elements
-        data = {}
-        elements = {
-            'customer_name': ['customer-name', 'proposal-customer'],
-            'system_size': ['system-size', 'proposal-system-size'],
-            'total_cost': ['total-cost', 'proposal-cost']
-        }
-        
-        for key, classes in elements.items():
-            for class_name in classes:
-                element = soup.find(class_=class_name)
-                if element:
-                    data[key] = element.text.strip()
-                    debug_print(f"Found {key}: {data[key]}")
-        
-        if data:
+            if js_response.status_code == 200:
+                debug_print("Got frontend.js, looking for data patterns...")
+                js_content = js_response.text
+                
+                # Look for data in JavaScript
+                data_patterns = [
+                    r'customer:\s*({[^}]+})',
+                    r'proposal:\s*({[^}]+})',
+                    r'data:\s*({[^}]+})'
+                ]
+                
+                for pattern in data_patterns:
+                    matches = re.finditer(pattern, js_content, re.DOTALL)
+                    for match in matches:
+                        try:
+                            data = json.loads(match.group(1))
+                            debug_print("Found data in JavaScript:", data)
+                            return data
+                        except:
+                            continue
+            
+            # Wait and try one more time
+            debug_print("Waiting for page to load...")
+            time.sleep(5)
+            
+            response = session.get(link, headers=HEADERS)
+            data = parse_html_content(response.text)
+            
             return data
-        
+            
         return None
         
     except Exception as e:
@@ -167,4 +181,4 @@ if st.button("Extract Data", type="primary"):
         st.error(f"Error: {str(e)}")
 
 with st.expander("Debug Information"):
-    st.write("Base Headers:", HEADERS)
+    st.write("Headers Used:", HEADERS)
