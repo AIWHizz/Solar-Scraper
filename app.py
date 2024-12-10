@@ -6,12 +6,7 @@ from datetime import datetime
 import re
 import json
 
-# Page config
-st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
-
-# Initialize session state
-if 'data' not in st.session_state:
-    st.session_state.data = pd.DataFrame()
+st.set_page_config(page_title="Aurora Data Investigator", layout="wide")
 
 HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
@@ -21,91 +16,101 @@ HEADERS = {
     'Referer': 'https://v2.aurorasolar.com/',
 }
 
-def investigate_response(response):
-    """Investigate the response type and content"""
-    st.write("=== RESPONSE INVESTIGATION ===")
-    st.write(f"Status Code: {response.status_code}")
-    st.write(f"Content Type: {response.headers.get('Content-Type')}")
-    st.write("Response Headers:", dict(response.headers))
-    
-    # Try to parse as JSON
+def get_version():
+    """Get the current Aurora frontend version"""
     try:
-        json_data = response.json()
-        st.write("Successfully parsed as JSON:", json_data)
-        return "json", json_data
-    except json.JSONDecodeError:
-        st.write("Not valid JSON")
-    
-    # Look at raw content
-    st.write("First 1000 characters of raw content:")
-    st.code(response.text[:1000])
-    
-    # Try to detect content type
-    if response.text.strip().startswith('{') or response.text.strip().startswith('['):
-        st.write("Content appears to be JSON but couldn't parse")
-    elif response.text.strip().startswith('<!DOCTYPE html>'):
-        st.write("Content appears to be HTML")
-    elif response.text.strip().startswith('<?xml'):
-        st.write("Content appears to be XML")
-    else:
-        st.write("Unknown content type")
-    
-    return "unknown", None
+        version_url = "https://aurora-v2.s3.amazonaws.com/fallback-version.json"
+        response = requests.get(version_url)
+        if response.status_code == 200:
+            version_data = response.json()
+            st.write("Version Data:", version_data)
+            return version_data.get('version')
+    except Exception as e:
+        st.write(f"Error getting version: {str(e)}")
+    return None
 
-def try_different_urls(base_url):
-    """Try different variations of the URL"""
-    urls_to_try = [
-        base_url,  # Original URL
-        base_url.replace('/e-proposal/', '/api/v2/proposals/'),  # API endpoint
-        base_url.replace('/e-proposal/', '/api/proposals/'),  # Alternative API
-        f"https://v2.aurorasolar.com/api/v2/proposals/{base_url.split('/')[-1]}/summary",  # Summary endpoint
-        f"https://v2.aurorasolar.com/api/v2/proposals/{base_url.split('/')[-1]}/content"   # Content endpoint
-    ]
+def investigate_proposal(link):
+    """Investigate a proposal link"""
+    st.write("=== INVESTIGATING PROPOSAL ===")
     
-    st.write("=== TRYING DIFFERENT URLS ===")
+    # Extract proposal ID
+    proposal_id = link.split('/')[-1]
+    st.write(f"Proposal ID: {proposal_id}")
+    
+    # Get current version
+    version = get_version()
+    st.write(f"Current Version: {version}")
     
     session = requests.Session()
     
-    for url in urls_to_try:
-        st.write(f"\nTrying URL: {url}")
-        try:
-            response = session.get(url, headers=HEADERS)
-            content_type, data = investigate_response(response)
-            if content_type == "json":
-                return data
-        except Exception as e:
-            st.write(f"Error with URL {url}: {str(e)}")
+    # Try different endpoints with detailed logging
+    endpoints = [
+        f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}",
+        f"https://v2.aurorasolar.com/api/v2/e-proposals/{proposal_id}",
+        f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/data",
+        f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/content"
+    ]
     
-    return None
+    for endpoint in endpoints:
+        st.write(f"\nTrying endpoint: {endpoint}")
+        try:
+            # First try without version
+            response = session.get(endpoint, headers=HEADERS)
+            st.write(f"Status: {response.status_code}")
+            st.write("Headers:", dict(response.headers))
+            
+            # Try to parse as JSON
+            try:
+                data = response.json()
+                st.write("JSON Response:", data)
+                continue
+            except:
+                st.write("Not JSON response")
+            
+            # Look for JavaScript files
+            if 'text/html' in response.headers.get('Content-Type', ''):
+                soup = BeautifulSoup(response.text, 'html.parser')
+                scripts = soup.find_all('script')
+                st.write(f"Found {len(scripts)} script tags")
+                
+                for script in scripts:
+                    if script.string and ('window.__INITIAL_STATE__' in str(script.string) or 'PROPOSAL_DATA' in str(script.string)):
+                        st.write("Found data script:")
+                        st.code(script.string[:500])
+            
+            # Try with version header
+            if version:
+                headers_with_version = HEADERS.copy()
+                headers_with_version['X-Aurora-Version'] = version
+                response = session.get(endpoint, headers=headers_with_version)
+                st.write(f"Status with version header: {response.status_code}")
+                
+                try:
+                    data = response.json()
+                    st.write("JSON Response with version:", data)
+                except:
+                    st.write("Not JSON response with version")
+            
+        except Exception as e:
+            st.write(f"Error: {str(e)}")
 
-st.title("🔍 Aurora Response Investigator")
+st.title("🔍 Aurora API Investigator")
 link = st.text_input("Paste Aurora Proposal Link:")
 
 if st.button("Investigate", type="primary"):
-    try:
-        with st.spinner("Investigating response..."):
-            data = try_different_urls(link)
-            
-            if data:
-                st.success("Found parseable data!")
-                st.json(data)
-            else:
-                st.warning("Could not find parseable data in any endpoint")
-                
-    except Exception as e:
-        st.error(f"Error during investigation: {str(e)}")
+    if not link:
+        st.error("Please enter a proposal link")
+    else:
+        investigate_proposal(link)
 
-with st.expander("Tips"):
+with st.expander("Debug Information"):
     st.markdown("""
     This investigator will:
-    1. Try different URL variations
-    2. Check response types
-    3. Attempt to parse content
-    4. Show raw response data
+    1. Extract the proposal ID
+    2. Get the current Aurora version
+    3. Try different API endpoints
+    4. Look for embedded data
+    5. Show all responses
     
-    Look for:
-    - JSON endpoints
-    - API redirects
-    - Authentication requirements
-    - Content-Type headers
+    Please paste a complete proposal link to begin investigation.
     """)
