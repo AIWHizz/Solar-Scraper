@@ -5,7 +5,6 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 import json
-import base64
 import time
 
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
@@ -16,10 +15,8 @@ HEADERS = {
     'Accept-Language': 'en-US,en;q=0.9',
     'Origin': 'https://v2.aurorasolar.com',
     'Referer': 'https://v2.aurorasolar.com/',
-    'X-Requested-With': 'XMLHttpRequest',
-    'Sec-Fetch-Site': 'same-origin',
-    'Sec-Fetch-Mode': 'cors',
-    'Sec-Fetch-Dest': 'empty'
+    'Access-Control-Request-Method': 'GET',
+    'Access-Control-Request-Headers': 'authorization,content-type,x-aurora-version',
 }
 
 def debug_print(msg, obj=None):
@@ -28,143 +25,108 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def analyze_js_content(js_content):
-    """Analyze JavaScript content for API patterns"""
-    debug_print("Analyzing JavaScript content...")
-    
-    # Look for API configuration
-    api_patterns = [
-        r'baseURL:\s*[\'"]([^\'"]+)[\'"]',
-        r'endpoint:\s*[\'"]([^\'"]+)[\'"]',
-        r'url:\s*[\'"]([^\'"]+proposals[^\'"]+)[\'"]',
-        r'headers:\s*({[^}]+})'
-    ]
-    
-    findings = {}
-    for pattern in api_patterns:
-        matches = re.findall(pattern, js_content)
-        if matches:
-            debug_print(f"Found pattern matches: {matches}")
-            findings[pattern] = matches
-    
-    return findings
-
 def get_proposal_data(link):
-    """Get proposal data with enhanced JS analysis"""
+    """Get proposal data with CORS handling"""
     try:
         # Extract proposal ID
         proposal_id = link.split('/')[-1]
         debug_print(f"Proposal ID: {proposal_id}")
         
-        # Get current version
+        # Create session
+        session = requests.Session()
+        
+        # Step 1: CORS Preflight
+        options_headers = HEADERS.copy()
+        options_headers.update({
+            'Access-Control-Request-Method': 'GET',
+            'Access-Control-Request-Headers': 'authorization,content-type,x-aurora-version'
+        })
+        
+        preflight_url = f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}"
+        debug_print("Sending OPTIONS request...")
+        
+        options_response = session.options(preflight_url, headers=options_headers)
+        debug_print(f"OPTIONS Response Status: {options_response.status_code}")
+        debug_print("OPTIONS Headers:", dict(options_response.headers))
+        
+        # Step 2: Get version
         version_response = requests.get("https://aurora-v2.s3.amazonaws.com/fallback-version.json")
         version_data = version_response.json()
         version = version_data.get('version')
         debug_print(f"Aurora Version: {version}")
         
-        # Create session
-        session = requests.Session()
+        # Step 3: Initial auth request
+        auth_url = "https://v2.aurorasolar.com/api/v2/auth"
+        auth_headers = HEADERS.copy()
+        auth_headers.update({
+            'Content-Type': 'application/json',
+            'X-Aurora-Version': version
+        })
         
-        # Get HLB JavaScript
-        hlb_url = f"https://v2.aurorasolar.com/hlb.{version}.js"
-        debug_print(f"Getting HLB JS from: {hlb_url}")
+        auth_data = {
+            "grant_type": "proposal_token",
+            "proposal_token": proposal_id
+        }
         
-        js_response = session.get(hlb_url)
-        debug_print(f"HLB JS Status: {js_response.status_code}")
+        debug_print("Sending auth request...")
+        auth_response = session.post(auth_url, headers=auth_headers, json=auth_data)
+        debug_print(f"Auth Response Status: {auth_response.status_code}")
         
-        if js_response.status_code == 200:
-            # Analyze JS content
-            js_findings = analyze_js_content(js_response.text)
-            debug_print("JavaScript Analysis:", js_findings)
+        if auth_response.status_code == 200:
+            try:
+                auth_data = auth_response.json()
+                debug_print("Auth Response:", auth_data)
+                token = auth_data.get('access_token')
+            except:
+                debug_print("No auth token received")
+                token = None
+        
+        # Step 4: Try different API endpoints with proper headers
+        api_endpoints = [
+            f"/api/v2/proposals/{proposal_id}/view",
+            f"/api/v2/proposals/{proposal_id}/data",
+            f"/api/v2/e-proposals/{proposal_id}/content",
+            f"/api/v2/hlb/proposals/{proposal_id}"
+        ]
+        
+        for endpoint in api_endpoints:
+            url = f"https://v2.aurorasolar.com{endpoint}"
+            debug_print(f"\nTrying endpoint: {url}")
             
-            # Get the initial page
-            initial_url = f"https://v2.aurorasolar.com/e-proposal/{proposal_id}"
-            initial_headers = HEADERS.copy()
-            initial_headers.update({
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9',
-                'X-Aurora-Version': version
+            request_headers = HEADERS.copy()
+            request_headers.update({
+                'Accept': 'application/json',
+                'Content-Type': 'application/json',
+                'X-Aurora-Version': version,
+                'Authorization': f'Bearer {token}' if token else None,
+                'X-Proposal-Token': proposal_id
             })
             
-            debug_print("Getting initial page...")
-            response = session.get(initial_url, headers=initial_headers)
-            debug_print(f"Initial Response Status: {response.status_code}")
+            # First send OPTIONS
+            debug_print("Sending endpoint OPTIONS...")
+            options_response = session.options(url, headers=options_headers)
+            debug_print(f"Endpoint OPTIONS Status: {options_response.status_code}")
             
-            if response.status_code == 200:
-                # Extract any tokens or config from the page
-                soup = BeautifulSoup(response.text, 'html.parser')
-                scripts = soup.find_all('script')
-                
-                config_data = None
-                for script in scripts:
-                    if script.string and 'window.__INITIAL_STATE__' in str(script.string):
-                        match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', str(script.string), re.DOTALL)
-                        if match:
-                            try:
-                                config_data = json.loads(match.group(1))
-                                debug_print("Found config data:", config_data)
-                            except:
-                                pass
+            # Then send GET
+            debug_print("Sending GET request...")
+            response = session.get(url, headers=request_headers)
+            debug_print(f"GET Response Status: {response.status_code}")
+            debug_print("Response Headers:", dict(response.headers))
             
-            # Try different API patterns
-            api_patterns = [
-                f"/api/v2/hlb/proposals/{proposal_id}",
-                f"/api/v2/hlb/{proposal_id}/view",
-                f"/api/v2/hlb/{proposal_id}/data",
-                f"/api/v2/e-proposals/{proposal_id}/shared"
-            ]
-            
-            for endpoint in api_patterns:
-                url = f"https://v2.aurorasolar.com{endpoint}"
-                debug_print(f"\nTrying endpoint: {url}")
-                
-                headers = HEADERS.copy()
-                headers.update({
-                    'X-Aurora-Version': version,
-                    'X-Proposal-Token': proposal_id,
-                    'Accept': 'application/json'
-                })
-                
-                if config_data and config_data.get('token'):
-                    headers['Authorization'] = f"Bearer {config_data['token']}"
-                
-                debug_print("Using headers:", headers)
-                
-                response = session.get(url, headers=headers)
-                debug_print(f"Response Status: {response.status_code}")
-                debug_print("Response Headers:", dict(response.headers))
-                
-                if response.status_code == 200:
-                    try:
-                        data = response.json()
-                        debug_print("Found JSON data!")
-                        return data
-                    except json.JSONDecodeError:
-                        debug_print("Response content preview:", response.text[:500])
-                        
-                        # Try to find JSON in HTML response
-                        if 'text/html' in response.headers.get('Content-Type', ''):
-                            soup = BeautifulSoup(response.text, 'html.parser')
-                            for script in soup.find_all('script'):
-                                if script.string:
-                                    json_patterns = [
-                                        r'window\.__PROPOSAL_DATA__\s*=\s*({.*?});',
-                                        r'window\.__INITIAL_STATE__\s*=\s*({.*?});',
-                                        r'{"proposal":\s*({.*?})\s*}',
-                                        r'data-proposal=\'({.*?})\''
-                                    ]
-                                    
-                                    for pattern in json_patterns:
-                                        match = re.search(pattern, str(script.string), re.DOTALL)
-                                        if match:
-                                            try:
-                                                data = json.loads(match.group(1))
-                                                debug_print("Found embedded JSON data!")
-                                                return data
-                                            except:
-                                                continue
+            try:
+                content_type = response.headers.get('Content-Type', '')
+                if 'application/json' in content_type:
+                    data = response.json()
+                    debug_print("Found JSON response:", data)
+                    return data
+                else:
+                    debug_print(f"Non-JSON content type: {content_type}")
+                    debug_print("Response preview:", response.text[:500])
+            except Exception as e:
+                debug_print(f"Error processing response: {str(e)}")
         
         return None
-        
+    
     except Exception as e:
         debug_print(f"Error during extraction: {str(e)}")
         return None
