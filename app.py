@@ -5,6 +5,7 @@ from bs4 import BeautifulSoup
 from datetime import datetime
 import re
 import json
+import time
 
 # Page config
 st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
@@ -13,16 +14,19 @@ st.set_page_config(page_title="Aurora Data Extractor", layout="wide")
 if 'data' not in st.session_state:
     st.session_state.data = pd.DataFrame()
 
+# Enhanced headers to mimic browser behavior
 HEADERS = {
-    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
-    'Accept': '*/*',
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept': 'application/json, text/plain, */*',
     'Accept-Language': 'en-US,en;q=0.9',
-    'Connection': 'keep-alive',
+    'Origin': 'https://v2.aurorasolar.com',
+    'Referer': 'https://v2.aurorasolar.com/',
+    'sec-ch-ua': '"Not_A Brand";v="99", "Google Chrome";v="120", "Chromium";v="120"',
+    'sec-ch-ua-mobile': '?0',
+    'sec-ch-ua-platform': '"Windows"',
     'Sec-Fetch-Site': 'same-origin',
     'Sec-Fetch-Mode': 'cors',
     'Sec-Fetch-Dest': 'empty',
-    'Cache-Control': 'no-cache',
-    'Pragma': 'no-cache',
 }
 
 def debug_print(msg, obj=None):
@@ -31,104 +35,85 @@ def debug_print(msg, obj=None):
     if obj:
         st.write(obj)
 
-def extract_proposal_data(response_text):
-    """Extract data with specific focus on finding known patterns"""
-    debug_print("Starting detailed extraction...")
-    
-    # Store the full response for debugging
-    with st.expander("Full Response Text"):
-        st.code(response_text)
-    
-    # First, look for any script tags containing our data
-    soup = BeautifulSoup(response_text, 'html.parser')
-    scripts = soup.find_all('script')
-    
-    debug_print(f"Found {len(scripts)} script tags")
-    
-    # Search for specific data patterns
-    data_patterns = {
-        'name': r'(?:customer|client)(?:["\']\s*:\s*["\'](Rob Appleyard|[^"\']+))',
-        'size': r'(\d+(?:\.\d+)?)\s*kW',
-        'cost': r'\$\s*([\d,]+(?:\.\d+)?)',
-    }
-    
-    extracted_data = {}
-    
-    # Search through the entire response text first
-    for key, pattern in data_patterns.items():
-        matches = re.findall(pattern, response_text, re.IGNORECASE)
-        if matches:
-            debug_print(f"Found {key} matches:", matches)
-            extracted_data[key] = matches[0]
-    
-    # If we didn't find the data, try parsing each script tag
-    if not extracted_data:
-        for script in scripts:
-            if script.string:
-                script_text = str(script.string)
-                # Look for window.__INITIAL_STATE__ or similar data
-                if '__INITIAL_STATE__' in script_text or 'PROPOSAL_DATA' in script_text:
-                    debug_print("Found potential data script")
-                    try:
-                        # Try to extract JSON data
-                        json_match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', script_text, re.DOTALL)
-                        if json_match:
-                            json_data = json.loads(json_match.group(1))
-                            debug_print("Extracted JSON data:", json_data)
-                            # Look for customer data in the JSON
-                            if 'customer' in json_data:
-                                extracted_data['name'] = json_data['customer'].get('name')
-                            if 'system' in json_data:
-                                extracted_data['size'] = json_data['system'].get('size_kw')
-                            if 'pricing' in json_data:
-                                extracted_data['cost'] = json_data['pricing'].get('total_cost')
-                    except Exception as e:
-                        debug_print(f"JSON parsing error: {str(e)}")
-    
-    # Try direct HTML elements if we still don't have the data
-    if not extracted_data.get('name'):
-        # Look for specific HTML elements that might contain the name
-        name_elements = [
-            soup.find('div', string=re.compile(r'Rob\s+Appleyard')),
-            soup.find(class_=re.compile(r'customer-name')),
-            soup.find('h1', string=re.compile(r'Rob\s+Appleyard')),
-            soup.find(string=re.compile(r'Dear\s+Rob\s+Appleyard'))
-        ]
-        
-        for elem in name_elements:
-            if elem:
-                debug_print("Found name element:", elem)
-                extracted_data['name'] = elem.text.strip()
-                break
-    
-    return extracted_data
-
 def get_proposal_data(link):
-    """Get proposal data with enhanced error handling"""
-    session = requests.Session()
-    
+    """Get proposal data using API endpoints"""
     try:
-        # First request to get the page
-        debug_print("Making initial request...")
-        response = session.get(link, headers=HEADERS)
-        debug_print(f"Response status: {response.status_code}")
+        # Extract proposal ID
+        proposal_id = link.split('/')[-1]
+        debug_print(f"Proposal ID: {proposal_id}")
+        
+        # Create session for consistent cookies
+        session = requests.Session()
+        
+        # First, try the direct API endpoint
+        api_url = f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/summary"
+        debug_print(f"Trying API endpoint: {api_url}")
+        
+        response = session.get(api_url, headers=HEADERS)
+        debug_print(f"API Response Status: {response.status_code}")
         
         if response.status_code == 200:
-            extracted_data = extract_proposal_data(response.text)
-            debug_print("Extracted data:", extracted_data)
+            try:
+                data = response.json()
+                debug_print("API Response Data:", data)
+                return data
+            except json.JSONDecodeError:
+                debug_print("Failed to parse API JSON response")
+        
+        # If direct API fails, try the proposal content endpoint
+        content_url = f"https://v2.aurorasolar.com/api/v2/proposals/{proposal_id}/content"
+        debug_print(f"Trying content endpoint: {content_url}")
+        
+        response = session.get(content_url, headers=HEADERS)
+        debug_print(f"Content Response Status: {response.status_code}")
+        
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                debug_print("Content Response Data:", data)
+                return data
+            except json.JSONDecodeError:
+                debug_print("Failed to parse content JSON response")
+        
+        # If API endpoints fail, try scraping the proposal page
+        debug_print("Trying direct page access")
+        response = session.get(link, headers=HEADERS)
+        
+        if response.status_code == 200:
+            # Try to find embedded data
+            soup = BeautifulSoup(response.text, 'html.parser')
+            scripts = soup.find_all('script')
             
-            # Format the data
-            return {
-                'customer_name': extracted_data.get('name', 'Not Found'),
-                'system_size': f"{extracted_data.get('size', 'Not Found')} kW" if extracted_data.get('size') else 'Not Found',
-                'total_cost': f"${extracted_data.get('cost', 'Not Found')}" if extracted_data.get('cost') else 'Not Found'
-            }
+            for script in scripts:
+                if script.string and 'window.__INITIAL_STATE__' in str(script.string):
+                    match = re.search(r'window\.__INITIAL_STATE__\s*=\s*({.*?});', str(script.string), re.DOTALL)
+                    if match:
+                        try:
+                            data = json.loads(match.group(1))
+                            debug_print("Found embedded data:", data)
+                            return data
+                        except json.JSONDecodeError:
+                            continue
+        
+        # If all else fails, try the legacy endpoint
+        legacy_url = f"https://aurorasolar.com/api/proposals/{proposal_id}"
+        debug_print(f"Trying legacy endpoint: {legacy_url}")
+        
+        response = session.get(legacy_url, headers=HEADERS)
+        if response.status_code == 200:
+            try:
+                data = response.json()
+                debug_print("Legacy Response Data:", data)
+                return data
+            except json.JSONDecodeError:
+                debug_print("Failed to parse legacy JSON response")
+        
+        return None
+        
     except Exception as e:
         debug_print(f"Error during extraction: {str(e)}")
-    
-    return None
+        return None
 
-# Main interface
 st.title("☀️ Aurora Proposal Data Extractor")
 link = st.text_input("Paste Aurora Proposal Link:")
 
@@ -138,25 +123,41 @@ if st.button("Process Link", type="primary"):
             extracted_data = get_proposal_data(link)
             
             if extracted_data:
-                debug_print("Final extracted data:", extracted_data)
+                debug_print("Processing extracted data")
                 
+                # Initialize data with default values
                 data = {
                     'Date': datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    'Client Name': extracted_data['customer_name'],
-                    'System Size': extracted_data['system_size'],
-                    'Total Cost': extracted_data['total_cost'],
-                    'Price per Watt': 'Calculating...',
+                    'Client Name': 'Not Found',
+                    'System Size': 'Not Found',
+                    'Price per Watt': 'Not Found',
+                    'Total Cost': 'Not Found',
                     'Link': link
                 }
                 
-                # Calculate price per watt if possible
-                try:
-                    if 'Not Found' not in [data['System Size'], data['Total Cost']]:
-                        size_kw = float(re.search(r'(\d+\.?\d*)', data['System Size']).group(1))
-                        cost = float(re.sub(r'[^\d.]', '', data['Total Cost']))
-                        data['Price per Watt'] = f"${(cost / (size_kw * 1000)):.2f}"
-                except Exception as e:
-                    debug_print(f"Price calculation error: {str(e)}")
+                # Try to extract client name
+                if 'customer' in extracted_data:
+                    data['Client Name'] = extracted_data['customer'].get('name', 'Not Found')
+                elif 'customerName' in extracted_data:
+                    data['Client Name'] = extracted_data['customerName']
+                
+                # Try to extract system size
+                if 'system' in extracted_data:
+                    size = extracted_data['system'].get('size_kw')
+                    if size:
+                        data['System Size'] = f"{size} kW"
+                
+                # Try to extract cost
+                if 'pricing' in extracted_data:
+                    cost = extracted_data['pricing'].get('total_cost')
+                    if cost:
+                        data['Total Cost'] = f"${cost:,.2f}"
+                        
+                        # Calculate price per watt if we have both size and cost
+                        if 'system' in extracted_data and extracted_data['system'].get('size_kw'):
+                            size_watts = float(extracted_data['system']['size_kw']) * 1000
+                            price_per_watt = cost / size_watts
+                            data['Price per Watt'] = f"${price_per_watt:.2f}"
                 
                 new_df = pd.DataFrame([data])
                 if st.session_state.data.empty:
@@ -167,6 +168,7 @@ if st.button("Process Link", type="primary"):
                 st.success("✅ Data extracted successfully!")
             else:
                 st.error("Could not extract data from the proposal")
+    
     except Exception as e:
         st.error(f"Error: {str(e)}")
 
@@ -187,4 +189,6 @@ if not st.session_state.data.empty:
 with st.expander("Debug Information"):
     st.write("Headers Used:", HEADERS)
     if 'response' in locals():
+        st.write("Response Status Code:", response.status_code)
         st.write("Response Headers:", dict(response.headers))
+        st.write("Content Type:", response.headers.get('content-type'))
